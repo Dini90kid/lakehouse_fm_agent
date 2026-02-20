@@ -1,137 +1,281 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+fmtool.py — Lakehouse FM Agent CLI
+
+Commands:
+  graph     -> Read LINEAGE.txt and emit a Mermaid graph file
+  plan      -> Produce a PLANNED object manifest (JSON) for review/approval
+  scaffold  -> Generate doc stubs + handler skeleton for a given FM
+  validate  -> (stub) Validate config and lineage inputs
+  test      -> (stub) Run unit/integration tests for a given FM
+  run       -> Execute handlers in topological order derived from LINEAGE.txt
+
+Run either as a module (recommended):
+  python -m lakehouse_fm_agent.fmtool --help
+
+Or as a script (works too):
+  python lakehouse_fm_agent/fmtool.py --help
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
-import sys
 import os
+import sys
 from pathlib import Path
 
-# --- Robust import strategy: works when run as a script or as a module ---
+# --------------------------------------------------------------------------------------
+# Robust import strategy:
+# - First try relative imports (when executed inside the package directory).
+# - If that fails, add this file's folder and its parent to sys.path
+#   and import as a proper package "lakehouse_fm_agent".
+# This covers Streamlit / job runners that change CWD.
+# --------------------------------------------------------------------------------------
 try:
-    from runtime.lineage import load_edges, topo_layers  # run as script within the package dir
+    # When running "python lakehouse_fm_agent/fmtool.py ..."
+    from runtime.lineage import load_edges, topo_layers
     from runtime.registry import resolve_handler, POINTERS
     from runtime.manifest import Manifest
 except ModuleNotFoundError:
-    # Add this file's directory and its parent to sys.path, then try package imports
     here = os.path.abspath(os.path.dirname(__file__))
-    parent = os.path.abspath(os.path.join(here, '..'))
+    parent = os.path.abspath(os.path.join(here, ".."))
     if here not in sys.path:
         sys.path.insert(0, here)
     if parent not in sys.path:
         sys.path.insert(0, parent)
     try:
-        from lakehouse_fm_agent.runtime.lineage import load_edges, topo_layers
-        from lakehouse_fm_agent.runtime.registry import resolve_handler, POINTERS
-        from lakehouse_fm_agent.runtime.manifest import Manifest
+        # When running "python -m lakehouse_fm_agent.fmtool ..."
+        from lakehouse_fm_agent.runtime.lineage import load_edges, topo_layers  # type: ignore
+        from lakehouse_fm_agent.runtime.registry import resolve_handler, POINTERS  # type: ignore
+        from lakehouse_fm_agent.runtime.manifest import Manifest  # type: ignore
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
-            'Cannot import runtime modules. If running from the project root, use:
-'
-            '  python -m lakehouse_fm_agent.fmtool <command> ...
-'
-            'Or ensure the working directory is the package folder.'
+            "Cannot import runtime modules.\n"
+            "Hints:\n"
+            "  • Ensure the folder name is exactly 'lakehouse_fm_agent' (it must be a package).\n"
+            "  • The following files must exist:\n"
+            "      lakehouse_fm_agent/__init__.py\n"
+            "      lakehouse_fm_agent/runtime/__init__.py\n"
+            "  • Run as a module from the repo root:\n"
+            "      python -m lakehouse_fm_agent.fmtool --help\n"
         ) from e
 
 
-def cmd_graph(args):
-    edges = load_edges(args.lineage)
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+def _echo(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _fail(msg: str, exit_code: int = 2) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr, flush=True)
+    sys.exit(exit_code)
+
+
+# --------------------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------------------
+def cmd_graph(args: argparse.Namespace) -> None:
+    """
+    Build a Mermaid graph from LINEAGE.txt
+    """
+    lineage_path = Path(args.lineage)
+    out_path = Path(args.out)
+
+    if not lineage_path.exists():
+        _fail(f"Lineage file not found: {lineage_path}")
+
+    edges = load_edges(str(lineage_path))
     lines = ["graph TD"]
-    for p, c, k, _s in edges:
-        lines.append(f'  "{p}" --> "{c}"')
-    Path(args.out).write_text("
-".join(lines), encoding='utf-8')
-    print(f"Mermaid saved: {args.out}")
+    for parent, child, kind, _skipped in edges:
+        # We ignore `kind` in the visual link label for simplicity;
+        # you can add it like: f'  "{parent}" -- {kind} --> "{child}"'
+        lines.append(f'  "{parent}" --> "{child}"')
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    _echo(f"Mermaid saved: {out_path}")
 
 
-def cmd_plan(args):
+def cmd_plan(args: argparse.Namespace) -> None:
+    """
+    Produce a PLANNED object manifest (JSON) for review/approval.
+    (Creation/apply happens elsewhere to avoid accidental changes.)
+    """
+    # Optional: also load edges if you want to plan contextually
+    # edges = load_edges(args.lineage)
+
     m = Manifest(plan_id=args.plan_id)
-    # Minimal references; customize per UC
-    m.ensure_table('uc_catalog','ref','fx_rates','FX conversion reference',[])
-    m.ensure_table('uc_catalog','ref','currency_decimals','Currency decimals',[])
-    m.ensure_table('uc_catalog','ref','uom_factors','UoM base/factors',[])
-    m.ensure_table('uc_catalog','ref','calendar','Enterprise calendar',[])
-    m.ensure_table('uc_catalog','ref','logsys_map','Logical system map',[])
-    Path(args.out).write_text(m.to_json(), encoding='utf-8')
-    print(f"Manifest saved: {args.out}")
+    # Minimal reference objects; adjust to your Unity Catalog layout
+    m.ensure_table("uc_catalog", "ref", "fx_rates", "FX conversion reference", [])
+    m.ensure_table("uc_catalog", "ref", "currency_decimals", "Currency decimals", [])
+    m.ensure_table("uc_catalog", "ref", "uom_factors", "UoM base/factors", [])
+    m.ensure_table("uc_catalog", "ref", "calendar", "Enterprise calendar", [])
+    m.ensure_table("uc_catalog", "ref", "logsys_map", "Logical system map", [])
+
+    out_path = Path(args.out)
+    out_path.write_text(m.to_json(), encoding="utf-8")
+    _echo(f"Manifest saved: {out_path}")
 
 
-def cmd_scaffold(args):
+def cmd_scaffold(args: argparse.Namespace) -> None:
+    """
+    Generate a doc trio (Master/LLD/Test) and a handler skeleton for an FM.
+    """
     fm = args.fm.upper()
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / 'master.md').write_text(f"# {fm} — Master Doc
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-AS-IS, TO-BE, lineage, pointers, code.", encoding='utf-8')
-    (out / 'design_lld.md').write_text(f"# {fm} — Design LLD
-
-Components, contracts, code slices.", encoding='utf-8')
-    (out / 'how_to_test.md').write_text(f"# {fm} — How to Test
-
-Unit + integration tests.", encoding='utf-8')
-    (out / 'handler.py').write_text(
-        (
-            'from lakehouse_fm_agent.runtime.context import Context
-
-
-'
-            'def handler(ctx: Context) -> None:
-'
-            '    """
-'
-            f'    Handler for {fm}. Implement per Master/LLD.
-'
-            '    """
-'
-            '    pass
-'
-        ),
-        encoding='utf-8',
+    (out_dir / "master.md").write_text(
+        f"# {fm} — Master Doc\n\nAS-IS, TO-BE, lineage, pointers, code.\n",
+        encoding="utf-8",
     )
-    print(f"Scaffold created under: {out}")
+    (out_dir / "design_lld.md").write_text(
+        f"# {fm} — Design LLD\n\nComponents, contracts, code slices.\n",
+        encoding="utf-8",
+    )
+    (out_dir / "how_to_test.md").write_text(
+        f"# {fm} — How to Test\n\nUnit + integration tests.\n",
+        encoding="utf-8",
+    )
+
+    # Handler skeleton referencing the package runtime context
+    handler_src = (
+        "from lakehouse_fm_agent.runtime.context import Context\n\n\n"
+        "def handler(ctx: Context) -> None:\n"
+        '    """\n'
+        f"    Handler for {fm}. Implement per Master/LLD.\n"
+        "    - Read inputs (ctx.current_df or ctx.read_uc(...))\n"
+        "    - Apply Spark SQL / UDF / joins according to patterns\n"
+        "    - Write outputs or assign ctx.current_df\n"
+        '    """\n'
+        "    pass\n"
+    )
+    (out_dir / "handler.py").write_text(handler_src, encoding="utf-8")
+
+    _echo(f"Scaffold created under: {out_dir}")
 
 
-def cmd_validate(args):
-    print('Validate config/lineage -- stub OK')
+def cmd_validate(args: argparse.Namespace) -> None:
+    """
+    Placeholder for config + lineage validation.
+    Extend with schema checks, required table presence, config sanity, etc.
+    """
+    # Example no-op validation:
+    if args.lineage and not Path(args.lineage).exists():
+        _fail(f"Provided lineage path not found: {args.lineage}")
+    if args.config and not Path(args.config).exists():
+        _fail(f"Provided config path not found: {args.config}")
+    _echo("Validate: OK (stub).")
 
 
-def cmd_test(args):
-    print(f'Run unit/integration tests for {args.fm} -- stub OK')
+def cmd_test(args: argparse.Namespace) -> None:
+    """
+    Placeholder for unit/integration tests.
+    Wire this to your real test runner (pytest, nose, etc.)
+    """
+    _echo(f"Run tests for FM={args.fm} (stub).")
 
 
-def cmd_run(args):
-    edges = load_edges(args.lineage)
-    for layer in topo_layers(edges):
-        for fm in layer:
-            fn = resolve_handler(fm)
-            if fn:
-                print(f"[RUN] {fm} -> handler")
-                fn(None)
+def cmd_run(args: argparse.Namespace) -> None:
+    """
+    Execute handlers in topological layers derived from LINEAGE.txt.
+    For standard BW FMs without handlers, log a pointer instead of failing.
+    """
+    lineage_path = Path(args.lineage)
+    if not lineage_path.exists():
+        _fail(f"Lineage file not found: {lineage_path}")
+
+    edges = load_edges(str(lineage_path))
+    layers = topo_layers(edges)
+
+    # Flatten layers into an ordered list (preserving topo order)
+    ordered = [fm for layer in layers for fm in layer]
+
+    # De-duplicate while preserving order (some nodes can appear multiple times in layers)
+    seen = set()
+    ordered_unique = []
+    for fm in ordered:
+        if fm not in seen:
+            seen.add(fm)
+            ordered_unique.append(fm)
+
+    _echo(f"Execution order (topological): {', '.join(ordered_unique)}")
+
+    # In real Databricks runs, you'd initialize a Context carrying Spark session/config.
+    # Here we just pass None; handlers should accept Context in your actual implementation.
+    for fm in ordered_unique:
+        fn = resolve_handler(fm)
+        if fn:
+            _echo(f"[RUN] {fm} -> handler")
+            try:
+                fn(None)  # replace with: fn(Context(spark)) in Databricks
+            except Exception as ex:
+                _fail(f"Handler for {fm} raised an exception: {ex}")
+        else:
+            ptr = POINTERS.get(fm.upper())
+            if ptr:
+                _echo(f"[POINTER] {fm}: {ptr}")
             else:
-                ptr = POINTERS.get(fm.upper())
-                if ptr:
-                    print(f"[POINTER] {fm}: {ptr}")
-                else:
-                    print(f"[SKIP] {fm}: no handler; BW pattern replaced elsewhere")
+                _echo(f"[SKIP] {fm}: no handler (likely BW pattern handled elsewhere)")
 
 
-def main():
-    ap = argparse.ArgumentParser('fmtool')
-    sp = ap.add_subparsers()
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser("fmtool", description="Lakehouse FM Agent CLI")
+    sp = ap.add_subparsers(dest="command")
 
-    p = sp.add_parser('graph'); p.add_argument('--lineage', required=True); p.add_argument('--out', required=True); p.set_defaults(fn=cmd_graph)
-    p = sp.add_parser('plan'); p.add_argument('--lineage', required=True); p.add_argument('--plan-id', required=True); p.add_argument('--out', required=True); p.set_defaults(fn=cmd_plan)
-    p = sp.add_parser('scaffold'); p.add_argument('--fm', required=True); p.add_argument('--out', required=True); p.set_defaults(fn=cmd_scaffold)
-    p = sp.add_parser('validate'); p.add_argument('--config'); p.add_argument('--lineage'); p.set_defaults(fn=cmd_validate)
-    p = sp.add_parser('test'); p.add_argument('--fm', required=True); p.set_defaults(fn=cmd_test)
-    p = sp.add_parser('run'); p.add_argument('--lineage', required=True); p.set_defaults(fn=cmd_run)
+    # graph
+    p = sp.add_parser("graph", help="Render Mermaid from LINEAGE.txt")
+    p.add_argument("--lineage", required=True, help="Path to LINEAGE.txt")
+    p.add_argument("--out", required=True, help="Path to output .mmd file")
+    p.set_defaults(fn=cmd_graph)
 
-    args = ap.parse_args()
-    if not hasattr(args, 'fn'):
-        ap.print_help(); sys.exit(1)
+    # plan
+    p = sp.add_parser("plan", help="Produce a PLANNED object manifest (JSON)")
+    p.add_argument("--lineage", required=False, help="Path to LINEAGE.txt (optional)")
+    p.add_argument("--plan-id", required=True, help="Plan id / batch reference")
+    p.add_argument("--out", required=True, help="Path to output manifest.json")
+    p.set_defaults(fn=cmd_plan)
+
+    # scaffold
+    p = sp.add_parser("scaffold", help="Create docs + handler skeleton for an FM")
+    p.add_argument("--fm", required=True, help="FM name (e.g., Y_DNP_CONV_BUOM_SU_SSU)")
+    p.add_argument("--out", required=True, help="Output folder for scaffolding")
+    p.set_defaults(fn=cmd_scaffold)
+
+    # validate
+    p = sp.add_parser("validate", help="Validate config + lineage (stub)")
+    p.add_argument("--config", required=False, help="Path to config (e.g., conf/tables.yml)")
+    p.add_argument("--lineage", required=False, help="Path to LINEAGE.txt")
+    p.set_defaults(fn=cmd_validate)
+
+    # test
+    p = sp.add_parser("test", help="Run unit/integration tests (stub)")
+    p.add_argument("--fm", required=True, help="Target FM to test")
+    p.set_defaults(fn=cmd_test)
+
+    # run
+    p = sp.add_parser("run", help="Execute handlers in topological order")
+    p.add_argument("--lineage", required=True, help="Path to LINEAGE.txt")
+    p.set_defaults(fn=cmd_run)
+
+    return ap
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not hasattr(args, "fn"):
+        ap.print_help()
+        sys.exit(1)
     args.fn(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
